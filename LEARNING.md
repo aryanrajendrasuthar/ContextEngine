@@ -309,3 +309,81 @@ There are three performance characteristics that matter in a vector search syste
 **Embedding latency.** On a local machine without a GPU, Ollama takes 50-200ms to produce one embedding using the CPU. This is acceptable for offline batch processing (the Kafka consumer) but would be unacceptable for real-time query handling. Sprint 4's query service will call Ollama to embed the user's question before searching Qdrant. On a machine with a modern GPU, this drops to under 5ms.
 
 **Index build vs. query.** Qdrant builds the HNSW graph incrementally as points are upserted. Adding points is slower when the index is large because the graph must be reconnected. This is why search performance degrades gracefully (logarithmic) but indexing throughput decreases as the collection grows. For a knowledge base that is mostly read (queries) rather than written (indexing), this is a favorable tradeoff.
+
+---
+
+## Sprint 4: Knowledge Graph and Query Intelligence
+
+### What the knowledge graph adds that vector search cannot
+
+Vector search answers "which documents are semantically similar to this question?" It does this extremely well. But it cannot answer a fundamentally different class of questions: "who knows about this?", "what other systems are related to this concept?", or "what decisions have been made in this area?"
+
+These questions require understanding relationships between entities, not just similarity between text. The knowledge graph is the data structure that models those relationships.
+
+After Sprint 4, the system knows not just that a document discusses Kafka — it knows that Sarah Chen authored it, that it mentions both Kafka and Redis, that there is a Decision node representing the team's choice to use Kafka over RabbitMQ, and that Marcus Williams has also authored five other documents that mention Kafka. When a developer asks "who should I talk to about our Kafka setup?", the graph traversal can surface Marcus and Sarah with supporting evidence, even if their names never appear in the query vector's nearest neighbors.
+
+This is the distinction between retrieval and reasoning. Vectors retrieve. Graphs reason about relationships.
+
+### How Neo4j's MERGE pattern enables idempotent graph construction
+
+The knowledge graph consumer processes a stream of events. The same event may arrive more than once (Kafka at-least-once delivery). Multiple events may reference the same person, the same concept, or the same system. If you used INSERT for node creation, you would end up with duplicate nodes and a corrupted graph.
+
+Neo4j's MERGE statement solves this. It means: "find a node matching this pattern, and if it does not exist, create it." The first time Sarah Chen authors a GitHub PR, a Person node is created for her. The second time she authors something, MERGE finds the existing node and the ON MATCH SET clause updates its properties. No duplicates are ever created, regardless of how many times the event is processed.
+
+The key insight is that MERGE requires a stable, unique identifier to match on. In ContextEngine, Person nodes are merged on `(organizationId, sourceAuthorId)`, Document nodes on `(organizationId, sourceId)`, and Concept nodes on `(organizationId, name)`. These combinations are guaranteed unique within a tenant. The organizational scope is always part of the match condition — you must never MERGE on a property that is not scoped to an organization, because that would allow data from different tenants to collapse into the same node.
+
+### What entity extraction does and why heuristics are sufficient here
+
+Entity extraction means identifying the significant named things in a piece of text: the technical systems, the people, the processes, the decisions. Full NLP entity extraction using a model like spaCy can identify arbitrary named entities from raw text. ContextEngine uses a simpler approach: keyword matching against a curated set of known technology terms, plus regular expression pattern matching for decision language.
+
+This is a deliberate engineering tradeoff. Keyword-based extraction is deterministic, fast, testable, and produces no false positives for the terms in the list. It does miss concepts not in the list. The LLM in the RAG pipeline compensates for this gap — it understands the full semantic content of the retrieved chunks without relying on the graph for concept labeling.
+
+For graph construction purposes, the goal is not to capture every concept mentioned in every document. It is to build enough structure that traversal queries ("who knows about Kafka?", "what decisions mention Redis?") produce useful results. A curated set of 40 technology keywords covers the concepts that appear most frequently in real engineering knowledge bases, which is where most of the traversal value comes from.
+
+In production, you would expand this set and add a spaCy pipeline for richer extraction. The interface is already defined — `EntityExtractor` returns a typed result that the consumer acts on. Improving the extraction logic requires only changing `EntityExtractor`, with no changes to the consumer or graph repository.
+
+### The full RAG pipeline step by step
+
+Understanding the exact sequence of operations in the query service helps you reason about where latency comes from and where failures can occur.
+
+**Step 1: Cache check.** Before any computation, the query hash (SHA-256 of organizationId + question) is checked in Redis. If the response is cached, it is returned immediately — typically under 5ms. This is why the cache TTL matters: a 1-hour TTL means the same question asked by anyone in the organization within an hour returns a cached answer, avoiding repeated Ollama calls.
+
+**Step 2: Question embedding.** The question is sent to Ollama's `/api/embeddings` endpoint and converted to a 768-dimensional vector. On a CPU, this takes 50–200ms. This is the same embedding model (nomic-embed-text) used to embed the document chunks during ingestion, which ensures that the question vector and document vectors are in the same semantic space — a necessary condition for similarity search to produce meaningful results.
+
+**Step 3: Vector search.** The question vector is sent to Qdrant's REST search API. Qdrant searches the organization's collection for the top-k most similar chunks. This typically takes 5–50ms even over a collection of millions of vectors, because HNSW traversal is logarithmic in the collection size.
+
+**Step 4: Graph context.** The sourceIds of the returned chunks are looked up in Neo4j to find related concepts and people. This query joins Document → Concept and Person → Document traversals. If the knowledge graph is empty (no events processed yet), this step returns empty lists and the pipeline continues without graph enrichment.
+
+**Step 5: LLM answer generation.** The retrieved chunks, graph context, and question are assembled into a structured prompt and sent to Ollama's `/api/chat` endpoint with the llama3.1:8b model. The system prompt explicitly instructs the model to answer only from the provided context and to cite sources. This is the slowest step — on a CPU without GPU acceleration, llama3.1:8b generates 10–30 tokens per second, so a 200-token answer takes 7–20 seconds.
+
+**Step 6: Cache and return.** The response is cached in Redis and returned to the caller. The response includes the answer text, the source documents with relevance scores and URLs, the confidence score (average cosine similarity of the top-3 chunks), related concepts from Neo4j, and related people from Neo4j.
+
+### Why source attribution is non-negotiable for enterprise knowledge tools
+
+Every fact in the answer is accompanied by a source: who wrote it, when, and a direct link back to the original document. This is not a feature — it is the fundamental requirement that separates a trustworthy knowledge tool from a chatbot.
+
+The reason is accountability. When a developer reads "the auth team decided to use Keycloak for enterprise SSO" and sees that the source is a specific Jira ticket written by Sarah Chen six months ago with a link to the ticket, they can verify that claim. They can also check whether the decision has been superseded by a more recent document. They can ask Sarah for context.
+
+Without source attribution, the system produces answers that sound authoritative but cannot be verified. Engineers will correctly distrust it after the first time they act on an answer and discover it was wrong or outdated. With source attribution, the system functions as a research tool: it surfaces the relevant primary sources and the engineer evaluates them.
+
+The confidence score serves a related purpose. A confidence of 0.91 means the retrieved chunks were highly similar to the question — the documents almost certainly contain relevant information. A confidence of 0.54 means the question touched on something at the edge of the knowledge base — the answer is less reliable and the engineer should dig further. Showing the confidence score lets the user calibrate how much weight to place on the answer.
+
+### How Redis query caching prevents LLM stampedes
+
+A "thundering herd" or "cache stampede" happens when many requests for the same expensive resource arrive simultaneously. In a query service context: if ten engineers ask "what is our database migration strategy?" within a short window, without caching each query triggers an Ollama LLM call taking 5–20 seconds. Ten concurrent calls overwhelm Ollama (which is single-threaded on CPU) and all ten callers wait.
+
+The Redis cache prevents this. The first request computes the answer and caches it. The next nine requests hit the cache and return in under 5ms. The key design decision is that the cache key includes the organizationId — a question from org-acme never returns cached results from org-beta, enforcing tenant isolation even in the cache layer.
+
+The cache is keyed by the normalized question (lowercased, stripped of leading/trailing whitespace) to increase hit rate. "Why did we use Kafka?" and "why did we use kafka?" are the same question and produce the same cache key.
+
+One important caveat: query caching means that if new documents are ingested that would change the answer, cached responses remain stale until the TTL expires. A 1-hour TTL is a practical balance between cache efficiency and freshness. For a knowledge base that evolves slowly (architectural decisions, not live metrics), 1 hour is reasonable. If you needed near-real-time freshness, you would either lower the TTL or implement cache invalidation triggered by new ingestion events — a more complex approach that is not warranted at this stage.
+
+### The relationship between the processed topic and the knowledge graph
+
+A key architectural property: the knowledge-graph-service does not communicate with the embedding service or the ingestion service directly. It only reads from Kafka. This is the event-driven architecture producing its intended benefits.
+
+When the embedding service publishes to `contextengine.knowledge.processed`, it includes the original event fields (sourceId, sourceType, content, authorId, authorName, timestamp, url) plus the Qdrant point IDs. The knowledge-graph-service reads this and creates exactly what it needs without querying any other service.
+
+This means the two services can fail independently. If the knowledge-graph-service is down for an hour, the embedding service continues processing and publishing to Kafka. When the graph service restarts, it reads from the offset where it left off and catches up. No data is lost, no coordination is required, and neither service needs to know the other exists.
+
+This property — where services communicate only through durable, replayable event logs rather than direct calls — is what makes the system resilient to partial failures in production.
