@@ -1,5 +1,5 @@
 
-CREATE TABLE audit_log (
+CREATE TABLE IF NOT EXISTS audit_log (
     id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     event_type      VARCHAR(100) NOT NULL,
     actor_id        UUID,
@@ -12,6 +12,6 @@ CREATE TABLE audit_log (
     occurred_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_audit_log_organization_id ON audit_log(organization_id);
-CREATE INDEX idx_audit_log_occurred_at     ON audit_log(occurred_at DESC);
-CREATE INDEX idx_audit_log_actor_id        ON audit_log(actor_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_organization_id ON audit_log(organization_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_occurred_at     ON audit_log(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor_id        ON audit_log(actor_id);

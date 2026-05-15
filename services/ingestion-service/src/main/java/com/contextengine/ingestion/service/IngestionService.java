@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Optional;
 import java.util.UUID;
 
 @Slf4j
@@ -86,5 +87,9 @@ public class IngestionService {
                 event.organizationId(), event.sourceId(), event.sourceType());
 
         return IngestionResult.ACCEPTED;
+    }
+
+    public Optional<KnowledgeEventEntity> findBySourceId(String organizationId, String sourceId) {
+        return repository.findByOrganizationIdAndSourceId(organizationId, sourceId);
     }
 }

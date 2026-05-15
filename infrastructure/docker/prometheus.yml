@@ -53,7 +53,4 @@ scrape_configs:
       - targets:
           - embedding-service:8086
 
-  - job_name: kafka
-    static_configs:
-      - targets:
-          - kafka:9092
+  # kafka broker metrics require a separate kafka-exporter sidecar; omitted here

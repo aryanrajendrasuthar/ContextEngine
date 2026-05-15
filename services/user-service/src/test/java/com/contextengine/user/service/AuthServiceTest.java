@@ -4,6 +4,7 @@ package com.contextengine.user.service;
 import com.contextengine.user.api.dto.AuthResponse;
 import com.contextengine.user.api.dto.LoginRequest;
 import com.contextengine.user.api.dto.RegisterRequest;
+import com.contextengine.user.audit.AuditService;
 import com.contextengine.user.model.Organization;
 import com.contextengine.user.model.User;
 import com.contextengine.user.model.UserRole;
@@ -42,6 +43,7 @@ class AuthServiceTest {
     @Mock JwtService jwtService;
     @Mock StringRedisTemplate redisTemplate;
     @Mock ValueOperations<String, String> valueOps;
+    @Mock AuditService auditService;
 
     @InjectMocks AuthService authService;
 

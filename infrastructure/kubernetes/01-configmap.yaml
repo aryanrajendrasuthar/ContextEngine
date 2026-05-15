@@ -7,6 +7,7 @@ metadata:
 data:
   # Infrastructure endpoints — these reference in-cluster service names
   KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
   REDIS_HOST: "redis"
   REDIS_PORT: "6379"
   SPRING_DATASOURCE_URL: "jdbc:postgresql://postgresql:5432/contextengine"

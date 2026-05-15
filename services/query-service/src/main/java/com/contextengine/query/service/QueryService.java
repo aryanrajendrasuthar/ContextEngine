@@ -89,7 +89,7 @@ public class QueryService {
                         "confidence", confidence),
                 null);
 
-        log.info("Query complete: org={}, sources={}, confidence={:.3f}",
+        log.info("Query complete: org={}, sources={}, confidence={}",
                 organizationId, sources.size(), confidence);
 
         return response;

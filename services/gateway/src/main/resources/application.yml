@@ -42,8 +42,8 @@ spring:
                 redis-rate-limiter.burstCapacity: ${QUERY_RATE_LIMIT_BURST:20}
                 redis-rate-limiter.requestedTokens: 1
                 key-resolver: "#{@organizationKeyResolver}"
-        - id: knowledge-graph-service
-          uri: ${KNOWLEDGE_GRAPH_SERVICE_URL:http://localhost:8085}
+        - id: graph-api
+          uri: ${QUERY_SERVICE_URL:http://localhost:8084}
           predicates:
             - Path=/api/v1/graph/**
       default-filters:

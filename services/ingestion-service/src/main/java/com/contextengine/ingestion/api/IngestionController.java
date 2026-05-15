@@ -27,12 +27,12 @@ public class IngestionController {
 
     private final IngestionService ingestionService;
 
-    @PostMapping
+    @PostMapping("/ingest")
     @Operation(
             summary = "Submit a knowledge event",
-            description = "Accepts a single KnowledgeEvent, validates it, deduplicates, and publishes it to the processing pipeline. Returns 202 for new events and 200 for duplicates.")
+            description = "Accepts a single KnowledgeEvent, validates it, deduplicates, and publishes it to the processing pipeline. Returns 201 for new events and 200 for duplicates.")
     @ApiResponses({
-            @ApiResponse(responseCode = "202", description = "Event accepted and queued for embedding"),
+            @ApiResponse(responseCode = "201", description = "Event accepted and queued for embedding"),
             @ApiResponse(responseCode = "200", description = "Event already exists, not reprocessed"),
             @ApiResponse(responseCode = "400", description = "Validation error — missing required fields or invalid format"),
             @ApiResponse(responseCode = "500", description = "Internal error — event could not be persisted or published")
@@ -43,9 +43,36 @@ public class IngestionController {
         if (result == IngestionResult.DUPLICATE) {
             return ResponseEntity.ok(IngestionResponse.duplicate(event.sourceId()));
         }
-        return ResponseEntity.status(HttpStatus.ACCEPTED)
+        return ResponseEntity.status(HttpStatus.CREATED)
                 .body(IngestionResponse.accepted(event.sourceId()));
     }
+
+    @GetMapping("/{sourceId}")
+    @Operation(
+            summary = "Check event processing status",
+            description = "Returns the current processing status of a knowledge event identified by its source ID.")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Event found — check status field"),
+            @ApiResponse(responseCode = "404", description = "Event with this sourceId not found for the organization")
+    })
+    public ResponseEntity<KnowledgeEventStatusResponse> getEventStatus(
+            @PathVariable String sourceId,
+            @RequestHeader("X-Organization-Id") String organizationId) {
+
+        return ingestionService.findBySourceId(organizationId, sourceId)
+                .map(entity -> ResponseEntity.ok(new KnowledgeEventStatusResponse(
+                        entity.getSourceId(),
+                        entity.getStatus().name(),
+                        entity.getCreatedAt(),
+                        entity.getUpdatedAt())))
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    public record KnowledgeEventStatusResponse(
+            String sourceId,
+            String status,
+            java.time.Instant createdAt,
+            java.time.Instant updatedAt) {}
 
     @PostMapping("/batch")
     @Operation(
