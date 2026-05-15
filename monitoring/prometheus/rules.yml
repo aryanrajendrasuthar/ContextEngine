@@ -1,0 +1,115 @@
+
+groups:
+  - name: contextengine.availability
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up{job=~"contextengine-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ContextEngine service {{ $labels.job }} is down"
+          description: "{{ $labels.job }} has been unreachable for more than 1 minute."
+
+      - alert: HighErrorRate
+        expr: |
+          rate(http_server_requests_seconds_count{status=~"5..",job=~"contextengine-.*"}[5m])
+          /
+          rate(http_server_requests_seconds_count{job=~"contextengine-.*"}[5m])
+          > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate on {{ $labels.job }}"
+          description: "More than 5% of requests are returning 5xx on {{ $labels.job }} ({{ $value | humanizePercentage }})."
+
+  - name: contextengine.latency
+    interval: 60s
+    rules:
+      - alert: QueryLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_server_requests_seconds_bucket{
+              job="contextengine-query-service",
+              uri="/api/v1/query"
+            }[5m])
+          ) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Query p99 latency exceeds 3 seconds"
+          description: "The 99th percentile query latency is {{ $value | humanizeDuration }}, above the 3s SLO."
+
+      - alert: QueryLatencyCritical
+        expr: |
+          histogram_quantile(0.99,
+            rate(http_server_requests_seconds_bucket{
+              job="contextengine-query-service",
+              uri="/api/v1/query"
+            }[5m])
+          ) > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Query p99 latency exceeds 10 seconds"
+          description: "Query service is severely degraded. p99={{ $value | humanizeDuration }}."
+
+  - name: contextengine.kafka
+    interval: 60s
+    rules:
+      - alert: KafkaConsumerLagHigh
+        expr: |
+          kafka_consumer_fetch_manager_records_lag_max{
+            client_id="embedding-service"
+          } > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: "The embedding-service consumer is {{ $value }} messages behind. Ingestion pipeline may be backed up."
+
+      - alert: KafkaConsumerLagCritical
+        expr: |
+          kafka_consumer_fetch_manager_records_lag_max{
+            client_id="embedding-service"
+          } > 10000
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka consumer lag is critically high"
+          description: "The embedding-service consumer is {{ $value }} messages behind. Immediate investigation required."
+
+  - name: contextengine.resources
+    interval: 60s
+    rules:
+      - alert: JvmMemoryPressure
+        expr: |
+          jvm_memory_used_bytes{area="heap",job=~"contextengine-.*"}
+          /
+          jvm_memory_max_bytes{area="heap",job=~"contextengine-.*"}
+          > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JVM heap usage above 85% on {{ $labels.job }}"
+          description: "{{ $labels.job }} heap is at {{ $value | humanizePercentage }}. Consider increasing memory limits or investigating leaks."
+
+      - alert: RateLimitTriggered
+        expr: |
+          rate(spring_cloud_gateway_requests_seconds_count{
+            outcome="FORWARD_ERROR",
+            status="429"
+          }[5m]) > 10
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "Rate limit frequently triggered"
+          description: "More than 10 rate-limit rejections per second in the last 5 minutes. Consider raising limits or investigating abuse."

@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     chunk_size_tokens: int = 512
     chunk_overlap_tokens: int = 50
 
+    # PII detection — requires presidio-analyzer and presidio-anonymizer
+    pii_detection_enabled: bool = os.getenv("PII_DETECTION_ENABLED", "false").lower() == "true"
+
     # Kafka poll loop interval in milliseconds
     kafka_poll_timeout_ms: int = 1000
 

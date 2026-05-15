@@ -13,6 +13,7 @@ from app.config import Settings, get_settings
 from app.embedder import EmbeddingError, embed_texts
 from app.kafka_producer import publish_failed, publish_processed
 from app.models import KnowledgeEvent
+from app.pii_detector import anonymize_pii
 from app.vector_store import upsert_chunks
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,15 @@ def _process_event(event: KnowledgeEvent, settings: Settings) -> None:
         "Processing event: source_id=%s, org=%s, source_type=%s",
         event.sourceId, event.organizationId, event.sourceType,
     )
+
+    if settings.pii_detection_enabled:
+        anonymized_content, pii_found = anonymize_pii(event.content)
+        if pii_found:
+            logger.info(
+                "PII anonymized in source_id=%s: %s",
+                event.sourceId, pii_found,
+            )
+            event = event.model_copy(update={"content": anonymized_content})
 
     chunks = chunk_event(event, settings.chunk_size_tokens, settings.chunk_overlap_tokens)
     logger.debug("Produced %d chunks for source_id=%s", len(chunks), event.sourceId)

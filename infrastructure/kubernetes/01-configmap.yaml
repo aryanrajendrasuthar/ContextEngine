@@ -1,0 +1,39 @@
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: contextengine-config
+  namespace: contextengine
+data:
+  # Infrastructure endpoints — these reference in-cluster service names
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://postgresql:5432/contextengine"
+  NEO4J_URI: "bolt://neo4j:7687"
+  NEO4J_USERNAME: "neo4j"
+  QDRANT_HOST: "qdrant"
+  QDRANT_PORT: "6333"
+  OLLAMA_BASE_URL: "http://ollama:11434"
+
+  # Service URLs used by the gateway (in-cluster ClusterIP service names)
+  USER_SERVICE_URL: "http://user-service:8081"
+  INGESTION_SERVICE_URL: "http://ingestion-service:8082"
+  CONNECTOR_SERVICE_URL: "http://connector-service:8083"
+  QUERY_SERVICE_URL: "http://query-service:8084"
+  KNOWLEDGE_GRAPH_SERVICE_URL: "http://knowledge-graph-service:8085"
+
+  # Application settings
+  CORS_ALLOWED_ORIGINS: "https://app.contextengine.io"
+  LOG_LEVEL: "INFO"
+  SECURITY_LOG_LEVEL: "WARN"
+  GATEWAY_LOG_LEVEL: "WARN"
+  DB_POOL_MAX_SIZE: "20"
+  DB_POOL_MIN_IDLE: "5"
+  JWT_ACCESS_TOKEN_EXPIRY: "900"
+  JWT_REFRESH_TOKEN_EXPIRY: "2592000"
+  OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
+  OLLAMA_CHAT_MODEL: "llama3.1:8b"
+  OLLAMA_TIMEOUT_SECONDS: "60"
+  QUERY_CACHE_TTL_SECONDS: "3600"
+  PII_DETECTION_ENABLED: "true"

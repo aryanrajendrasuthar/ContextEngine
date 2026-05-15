@@ -4,13 +4,16 @@ package com.contextengine.query.service;
 import com.contextengine.query.api.dto.QueryRequest;
 import com.contextengine.query.api.dto.QueryResponse;
 import com.contextengine.query.api.dto.SourceDocument;
+import com.contextengine.query.audit.AuditService;
 import com.contextengine.query.service.GraphContextService.GraphContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Orchestrates the full RAG pipeline:
@@ -31,6 +34,7 @@ public class QueryService {
     private final GraphContextService graphContext;
     private final LlmService llmService;
     private final QueryCacheService cacheService;
+    private final AuditService auditService;
 
     public QueryResponse query(QueryRequest request, String organizationId) {
         log.info("Query received: org={}, question length={}", organizationId, request.question().length());
@@ -38,8 +42,12 @@ public class QueryService {
         Optional<QueryResponse> cached = cacheService.get(organizationId, request.question());
         if (cached.isPresent()) {
             log.info("Cache hit for org={}", organizationId);
-            // Return a new record with cacheHit=true (the stored record always has cacheHit=false)
             QueryResponse hit = cached.get();
+            auditService.record("QUERY_CACHE_HIT", null, null,
+                    safeUuid(organizationId), "KNOWLEDGE_BASE", organizationId,
+                    Map.of("question_length", request.question().length(), "source_count", hit.sources().size()),
+                    null);
+            // Return a new record with cacheHit=true (the stored record always has cacheHit=false)
             return new QueryResponse(hit.answer(), hit.sources(), hit.confidence(),
                     hit.relatedConcepts(), hit.relatedPeople(), true);
         }
@@ -74,9 +82,24 @@ public class QueryService {
 
         cacheService.put(organizationId, request.question(), response);
 
+        auditService.record("QUERY_EXECUTED", null, null,
+                safeUuid(organizationId), "KNOWLEDGE_BASE", organizationId,
+                Map.of("question_length", request.question().length(),
+                        "source_count", sources.size(),
+                        "confidence", confidence),
+                null);
+
         log.info("Query complete: org={}, sources={}, confidence={:.3f}",
                 organizationId, sources.size(), confidence);
 
         return response;
+    }
+
+    private static UUID safeUuid(String value) {
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 }

@@ -127,22 +127,84 @@ OpenAPI/Swagger documentation is available at `http://localhost:{port}/swagger-u
 
 ## Running Tests
 
+Unit and integration tests:
+
 ```bash
-mvn test          # Unit tests
+mvn test          # Unit tests (all services)
 mvn verify        # Integration tests (requires Docker for Testcontainers)
 ```
+
+End-to-end tests against a running stack:
+
+```bash
+pip install -r tests/e2e/requirements.txt
+pytest tests/e2e/ -v --timeout=120
+```
+
+Prerequisites for the E2E suite: the full stack must be running via `docker compose up` with Kafka, PostgreSQL, Qdrant, Neo4j, Redis, and Ollama all healthy. The test suite registers its own organization and ingests its own documents, so it does not depend on pre-existing data.
+
+Load tests (requires [k6](https://k6.io/docs/get-started/installation/)):
+
+```bash
+k6 run --env BASE_URL=http://localhost:8080 \
+       --env AUTH_TOKEN=$TOKEN \
+       --env ORG_ID=$ORG \
+       tests/load/k6-query.js
+```
+
+See `docs/PERFORMANCE.md` for methodology, SLO targets, and how to interpret results.
+
+## Observability
+
+Grafana is available at `http://localhost:3001` with a pre-built dashboard covering query throughput, latency percentiles, cache hit rate, Kafka consumer lag, ingestion throughput, error rates, and JVM heap usage.
+
+Prometheus is at `http://localhost:9091`. All Java services expose `/actuator/prometheus`. The embedding service exposes `/metrics` at port 8086.
+
+Alert rules covering service availability, query latency SLOs, Kafka consumer lag, JVM memory pressure, and rate limiting are defined in `monitoring/prometheus/rules.yml`.
+
+## Deployment
+
+For Kubernetes deployment, Helm charts are provided under `helm/contextengine/`. A single `values.yaml` drives all eight services.
+
+```bash
+helm install contextengine helm/contextengine/ \
+  --set secrets.jwtSecret="<your-secret>" \
+  --set secrets.dbPassword="<your-password>"
+```
+
+Raw Kubernetes manifests are in `infrastructure/kubernetes/` if you prefer to manage them directly.
 
 ## Project Structure
 
 ```
 contextengine/
-├── docs/               Architecture documentation and ADRs
-├── services/           All backend microservices
-├── frontend/           React 18 + TypeScript + Tailwind CSS
-├── infrastructure/     Docker, Kubernetes, scripts
-├── scripts/            Data generators and operational scripts
-├── LEARNING.md         Engineering education notes per sprint
-└── docker-compose.yml  Full local development stack
+├── docs/
+│   ├── api/                    Complete API reference
+│   ├── architecture/           Architecture decision records (ADRs)
+│   ├── decisions/              Technical decision log
+│   ├── runbooks/               Incident response and operational guides
+│   └── PERFORMANCE.md          Load test methodology and SLO documentation
+├── services/
+│   ├── gateway/                Spring Cloud Gateway — routing, rate limiting
+│   ├── user-service/           Authentication, organizations, API keys
+│   ├── ingestion-service/      Event intake and Kafka publishing
+│   ├── connector-service/      Source system connectors
+│   ├── embedding-service/      Python — Kafka consumer, chunking, Qdrant
+│   ├── knowledge-graph-service/Kafka consumer, NER, Neo4j graph construction
+│   └── query-service/          RAG pipeline, graph context, LLM synthesis
+├── frontend/                   React 18 + TypeScript + Tailwind CSS + Vite
+├── helm/contextengine/         Helm chart for Kubernetes deployment
+├── infrastructure/kubernetes/  Raw Kubernetes manifests
+├── monitoring/
+│   ├── prometheus/             Alert rules
+│   └── grafana/dashboards/     Pre-built operational dashboard
+├── tests/
+│   ├── e2e/                    End-to-end pytest suite
+│   └── load/                   k6 load tests for query and ingestion
+├── scripts/                    Data generators and operational scripts
+├── LEARNING.md                 Engineering education notes, one section per sprint
+├── CONTRIBUTING.md             Branch strategy and code review standards
+└── docker-compose.yml          Full local development stack
 ```
 
 ## Contributing

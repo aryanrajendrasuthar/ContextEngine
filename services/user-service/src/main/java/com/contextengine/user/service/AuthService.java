@@ -4,6 +4,7 @@ package com.contextengine.user.service;
 import com.contextengine.user.api.dto.AuthResponse;
 import com.contextengine.user.api.dto.LoginRequest;
 import com.contextengine.user.api.dto.RegisterRequest;
+import com.contextengine.user.audit.AuditService;
 import com.contextengine.user.model.Organization;
 import com.contextengine.user.model.User;
 import com.contextengine.user.model.UserRole;
@@ -23,6 +24,7 @@ import java.text.Normalizer;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -40,6 +42,7 @@ public class AuthService {
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
     private final StringRedisTemplate redisTemplate;
+    private final AuditService auditService;
 
     @Transactional
     public AuthResponse register(RegisterRequest request) {
@@ -61,6 +64,9 @@ public class AuthService {
         userRepository.save(user);
 
         log.info("Registered user {} in organization {}", user.getEmail(), org.getSlug());
+        auditService.record("USER_REGISTERED", user.getId(), user.getEmail(),
+                org.getId(), "USER", user.getId().toString(),
+                Map.of("organizationSlug", org.getSlug(), "role", user.getRole().name()), null);
         return issueTokens(user);
     }
 
@@ -81,6 +87,9 @@ public class AuthService {
         userRepository.save(user);
 
         log.info("User {} logged in", user.getEmail());
+        auditService.record("USER_LOGIN", user.getId(), user.getEmail(),
+                user.getOrganization().getId(), "USER", user.getId().toString(),
+                Map.of("role", user.getRole().name()), null);
         return issueTokens(user);
     }
 

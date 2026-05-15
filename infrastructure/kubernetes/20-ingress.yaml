@@ -1,0 +1,38 @@
+
+# Requires an Ingress controller in the cluster (nginx-ingress is recommended).
+# Install with: helm install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: contextengine-ingress
+  namespace: contextengine
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # Uncomment to enable TLS via cert-manager
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.contextengine.io
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+  # tls:
+  #   - hosts:
+  #       - app.contextengine.io
+  #     secretName: contextengine-tls

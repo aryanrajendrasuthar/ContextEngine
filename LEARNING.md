@@ -541,4 +541,177 @@ The primary reason is context preservation. In a form-based interface, each quer
 
 The secondary reason is perceived responsiveness. The bouncing dots animation during the LLM's response (which may take 5–20 seconds on CPU) signals that the system is working. Without this feedback, users assume the page has frozen.
 
+---
+
+## Sprint 6: Production Hardening, Observability, and Deployment
+
+### What Kubernetes is and why production systems run on it
+
+When you run `docker compose up`, Docker starts containers on your local machine. If one crashes, you restart it manually. If you need more instances to handle more traffic, you add them manually. If the machine running everything goes down, the system is offline. This is fine for development but completely inadequate for production.
+
+Kubernetes is a container orchestrator — a system that manages containers across a cluster of machines and handles failures, scaling, and deployment automatically. You describe the desired state of your system declaratively ("I want three replicas of the query-service, each with 2 CPU and 2 Gi memory"), and Kubernetes continuously works to make reality match that description.
+
+The core primitives you interact with:
+
+**Pod** — the smallest deployable unit. Usually one container. Kubernetes schedules pods onto nodes (machines in the cluster).
+
+**Deployment** — manages a set of identical pods. You tell it how many replicas you want. If a pod crashes, the Deployment controller creates a replacement. If you push a new container image, the Deployment performs a rolling update: it brings up new pods before tearing down old ones so the service stays available.
+
+**Service** — a stable network address that routes to the pods of a Deployment. Pods are ephemeral and get new IP addresses when replaced. A Service provides a consistent DNS name that other services can use.
+
+**HorizontalPodAutoscaler (HPA)** — scales the number of pod replicas up or down based on CPU utilization or custom metrics. ContextEngine's gateway and query-service have HPAs because they are the components most likely to need more capacity under query load.
+
+**ConfigMap and Secret** — ways to inject configuration into pods without baking it into the container image. ConfigMap is for non-sensitive configuration. Secret is for passwords, tokens, and keys. We store JWT secrets, database passwords, and Neo4j credentials in Secrets.
+
+**Ingress** — defines how external HTTP traffic enters the cluster. Our Ingress routes `/api` to the gateway Service and `/` to the frontend Service, acting as the single external entry point.
+
+### Why Helm makes Kubernetes manageable
+
+Once you have more than two or three Kubernetes resources, the YAML files multiply quickly. The gateway alone has a Deployment, a Service, and an HPA — three files. With eight services, that is 24+ files before you add ConfigMaps, Secrets, and Ingress. Every file looks almost identical with minor differences in names and port numbers.
+
+Helm is a templating system for Kubernetes manifests. You write a template once with variables in Go template syntax (`{{ .Values.service.port }}`), define all the variable values in a `values.yaml` file, and Helm renders the final YAML at install time by substituting the values.
+
+ContextEngine's Helm chart uses a `range` pattern where all eight services are defined in a map in `values.yaml` and a single `deployment.yaml` template loops over them:
+
+```yaml
+{{- range $name, $svc := .Values.services }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+spec:
+  replicas: {{ $svc.replicas }}
+  ...
+{{- end }}
+```
+
+This means adding a ninth service to the deployment requires only adding an entry to `values.yaml` — no new template files. Differences between services (health endpoint path, memory requirements, whether to mount the Redis Secret) are handled by conditionals inside the template.
+
+Helm also tracks what is installed via a "release". `helm install`, `helm upgrade`, and `helm rollback` manage the lifecycle. `helm upgrade` applies the diff between the current and desired state, which is exactly what you want for zero-downtime deployments.
+
+### What PII detection is and why it belongs in the embedding pipeline
+
+PII stands for Personal Identifiable Information — names, email addresses, phone numbers, social security numbers, and similar data that can be used to identify a specific person. Regulations like GDPR (Europe) and CCPA (California) impose obligations on organizations that store and process PII. Storing an employee's personal phone number in a vector database without consent or a lawful basis creates legal exposure.
+
+ContextEngine ingests content from sources like Slack and GitHub that routinely contain PII. A Slack message might contain "please call John at +1-555-123-4567 to discuss the incident". If that message gets embedded and stored in Qdrant, the phone number is retrievable via semantic search by anyone in the organization.
+
+The solution is to detect and anonymize PII before embedding. We use Microsoft Presidio, which is an open-source NLP system specifically designed for this task. Presidio's analyzer identifies entity types (PHONE_NUMBER, EMAIL_ADDRESS, PERSON, etc.) in text and returns their character positions and confidence scores. The anonymizer replaces the identified spans with type tokens: the message becomes "please call `<PERSON>` at `<PHONE_NUMBER>` to discuss the incident".
+
+The anonymized text is stored in Qdrant. The original text is never stored. Semantic search still works because the meaning of the surrounding text is preserved — an embedding model encodes "please call `<PERSON>` to discuss the incident" with similar proximity to "escalate the incident to the on-call engineer" as the original text.
+
+The feature is gated by the `PII_DETECTION_ENABLED` environment variable (default false) because Presidio adds latency to the embedding pipeline. For organizations that trust their internal content is not PII-sensitive, or that have separate data governance systems upstream, the overhead is unnecessary. For regulated industries (healthcare, finance, legal), it should be enabled.
+
+### How rate limiting works and what it protects against
+
+Rate limiting is a mechanism that rejects requests once a client has sent more than a configured number in a given time window. Without it, a single misbehaving or malicious client can consume all available server resources, causing the service to degrade for every other user.
+
+Spring Cloud Gateway implements rate limiting via the `RequestRateLimiter` filter, which uses Redis to track request counts. The token bucket algorithm is used: each client has a "bucket" that refills at a constant rate (`replenishRate`). Each request consumes one token. If the bucket is empty, the gateway returns HTTP 429 Too Many Requests immediately without forwarding the request to the upstream service.
+
+The `KeyResolver` bean determines what constitutes a "client" for bucketing purposes. We use the `X-Organization-Id` header, which means each organization gets its own independent bucket. One organization's heavy usage does not consume another organization's capacity.
+
+The query route is configured with `replenishRate: 10, burstCapacity: 20`. This means an organization can send 10 queries per second steadily, or burst up to 20 in a short window. After the burst, it returns to the 10/s sustained rate. The ingestion route has lower limits (5/s steady, 10 burst) because ingestion triggers Kafka messages and downstream processing, which are more expensive per request.
+
+In a multi-tenant SaaS product, this is a core business protection mechanism. It prevents one customer's poorly written integration from impacting another customer's experience.
+
+### What audit logging is and why it cannot be on the same transaction
+
+An audit log is an immutable record of significant actions taken in a system: who did what, to which resource, at what time. Audit logs serve compliance requirements, security investigations, and debugging. When an incident occurs ("the wrong documents were deleted at 2:15 AM"), the audit log tells you who made the request and from which IP address.
+
+Two design decisions are critical and non-obvious to junior engineers:
+
+**The audit log must be written asynchronously.** If writing the audit record is synchronous and part of the main request handler, any failure in the audit write — database timeout, connection exhaustion — will return a 500 error to the user even though the main operation succeeded. The user's document was ingested successfully, but they get an error message. This is wrong. The audit record is observational; it should never affect the outcome of the action it is recording.
+
+We use Spring's `@Async` annotation to run `AuditService.record()` in a thread pool thread. The request handler calls `auditService.record(...)` and immediately returns. The audit write happens in the background.
+
+**The audit log must use a separate transaction.** The `@Transactional(propagation = REQUIRES_NEW)` annotation on `AuditService.record()` means the audit write runs in a completely new database transaction, independent of any transaction the caller is in. If the caller's transaction is later rolled back (the main operation failed), the audit record is still committed. You need to know that an attempt was made, even if it failed. If the audit write fails, it does not roll back the caller's transaction.
+
+This combination — async + separate transaction + swallowed exceptions — means audit logging has a zero-impact guarantee: it cannot make operations slower, cannot make operations fail, and cannot interfere with the consistency of the main data model.
+
+### What Prometheus and Grafana do and why they are essential
+
+A running service that produces no telemetry is a black box. When it is slow, you cannot tell why. When it fails, you find out from a user complaint. Observability is the practice of making a system's internal state visible through external signals.
+
+**Prometheus** is a metrics collection system. Services expose a `/actuator/prometheus` endpoint that serves their current metrics as text. Prometheus scrapes this endpoint on a schedule and stores the time series in its database. The metrics are counters (requests_total, errors_total), gauges (current_heap_used_bytes, active_connections), and histograms (request_duration_seconds with p50, p95, p99 quantile computation).
+
+Spring Boot Actuator plus the Micrometer library provides these metrics automatically for any Spring Boot application — you get JVM heap, garbage collection pause time, HTTP request counts, and HTTP request latency histograms with no additional code. The embedding service exposes similar metrics manually via the `prometheus_client` Python library.
+
+**Grafana** is a visualization layer over Prometheus. You write PromQL queries (Prometheus's query language) and Grafana renders them as graphs, gauges, and tables on a dashboard. ContextEngine's dashboard has 9 panels because those are the 9 things an on-call engineer needs to see at a glance during an incident:
+
+Query throughput tells you if requests are coming in at all. Latency percentiles tell you how fast the system is responding. Cache hit rate tells you if Redis is effective. Kafka consumer lag tells you if the embedding pipeline is keeping up with ingestion volume. Error rates tell you if something is broken. JVM heap tells you if a service is about to run out of memory. The 429 rate tells you if customers are hitting rate limits.
+
+These panels do not just answer "is the system healthy?" They answer "where specifically is the problem?", which is what an engineer needs to diagnose and fix an incident quickly.
+
+### What Prometheus alerting rules do
+
+Grafana dashboards require a human to look at them. Alert rules are automated monitors that trigger when a metric crosses a threshold. They are defined in `monitoring/prometheus/rules.yml` and Prometheus evaluates them on a schedule (every 30 seconds by default).
+
+When an alert fires, Prometheus sends it to the Alertmanager, which routes it to the configured notification channel — PagerDuty, Slack, email, or OpsGenie. An on-call engineer receives a page with the alert name, the triggering metric value, and a link to the relevant Grafana dashboard.
+
+ContextEngine has 8 alert rules organized in two severity tiers:
+
+**Warning** — degraded state that needs attention within business hours: query latency above 1.5s p99, Kafka consumer lag above 1,000 messages, JVM heap above 80%.
+
+**Critical** — immediate response required: a service is down entirely, query latency above 3s p99 (SLO breach), Kafka lag above 5,000 messages (pipeline falling significantly behind), rate limit trigger rate above 10/min (either abuse or legitimate customers are being throttled too aggressively).
+
+The distinction between warning and critical determines when engineers are paged. Being paged at 3 AM for a warning-level condition creates alert fatigue — engineers start ignoring pages, which means critical pages also get ignored. Careful threshold calibration is part of building a trustworthy on-call rotation.
+
+### What end-to-end tests validate and why they are different from unit tests
+
+A unit test verifies that a single function works in isolation. An integration test verifies that a few components work together. An end-to-end (E2E) test verifies that the entire system works from the user's perspective — it uses the public API the same way a real client would.
+
+The ContextEngine E2E suite registers a new organization, ingests a document, waits for the embedding pipeline to process it, submits a natural language query, and asserts that the answer cites the ingested document as a source. No part of this is mocked. The test is talking to a real running stack with real Kafka messages, real Qdrant vector search, and a real LLM response.
+
+This is what no unit test can catch. A unit test might verify that `QueryService.query()` calls `qdrantClient.search()` with the right parameters. But it cannot verify that the vector stored in Qdrant by the embedding service is retrievable by a query about the same topic, that the chunk boundaries were set correctly, that the LLM prompt was constructed in a way that produces grounded answers, or that the `sources` field in the response correctly references the ingested document's ID.
+
+E2E tests are slower and more brittle than unit tests — they require the full stack to be running, they involve real network calls, and they have inherent timing dependencies (the `wait_for_processing` helper polls up to 90 seconds for the embedding pipeline to complete). This is acceptable because they test something irreplaceable: does the full system actually do what it claims to do?
+
+The practical rule is: unit tests for logic, integration tests for boundaries, E2E tests for user-facing flows. You need all three.
+
+### How k6 load tests work and what the numbers mean
+
+k6 is a JavaScript-based load testing tool. It runs "virtual users" (VUs) concurrently, each executing your test script in a loop. The script makes HTTP requests, checks assertions, records metrics, and sleeps between requests to simulate realistic user pacing.
+
+The `stages` configuration ramps VUs up and down over time. The query test ramps from 10 to 50 to 100 VUs and then down to 0 over about 4 minutes. This simulates a realistic traffic pattern: gradual increase, sustained peak, then taper.
+
+k6 collects histograms over all requests and computes percentile latencies:
+
+**p50 (median)** — half of all requests were faster than this. It tells you what the typical user experiences.
+
+**p95** — 95% of requests were faster than this. It tells you what the fast majority experiences. A service with p50=200ms and p95=800ms is mostly fast with occasional slow requests — this is typical of cache-assisted systems where cache misses are slower.
+
+**p99** — 99% of requests were faster than this. It tells you what the tail looks like. A high p99 with a low p95 means rare but severe slowdowns — often a GC pause, a cold-start, or lock contention. SLOs are typically defined on p99 rather than p95 because p95 can look fine while 1 in 20 users has a terrible experience.
+
+The `thresholds` section defines pass/fail criteria. If `p(99)<3000` fails, k6 exits with a non-zero status code. In a CI/CD pipeline, this causes the pipeline to fail, blocking the deployment. This is how performance regressions are caught automatically.
+
+### What multi-tenant data isolation means and how ContextEngine implements it
+
+Multi-tenancy means multiple organizations (tenants) use the same deployed system while each organization's data remains completely invisible to every other organization. In ContextEngine, Organization A's ingested documents must never appear in Organization B's query results, and Organization A must never be able to query Organization B's knowledge graph.
+
+Isolation is implemented at every data store:
+
+**PostgreSQL** — Every table that stores organization-scoped data has an `organization_id` column. Every query in every service includes a `WHERE organization_id = ?` predicate. This is enforced in application code. Row-Level Security (RLS) in PostgreSQL can enforce this at the database level as an additional safety layer, but the application-level constraint is the first line of defense.
+
+**Qdrant** — Each organization gets its own collection, named by the organization ID. The embedding service creates the collection on first ingestion if it does not exist. A search request always specifies the organization's collection name, so it is structurally impossible to search across organizations.
+
+**Neo4j** — All nodes include an `organizationId` property and all queries filter by it. There are no cross-organization edges. Cypher queries in the knowledge-graph-service and query-service always include `WHERE n.organizationId = $orgId`.
+
+**Redis** — Cache keys are scoped by organization ID. The pattern is `query:cache:{orgId}:{questionHash}`. A cache hit in one organization cannot surface a cached answer from another.
+
+The `X-Organization-Id` header on every authenticated request carries the organization context through the gateway to all downstream services. The JWT also embeds the organization ID, which serves as a trust-but-verify mechanism: if the header and the JWT disagree, the request is rejected.
+
+This is a non-trivial amount of discipline to maintain as the codebase grows. Any developer who adds a new query to PostgreSQL, a new Qdrant search, a new Cypher query, or a new Redis key must include the organization scope. Code review should always check for missing organization filters on any data access.
+
+### The production readiness mindset
+
+After six sprints of building ContextEngine, you have touched nearly every layer of a modern distributed system. The list of things you now understand by actually building them includes: JWT authentication, vector databases, graph databases, message queues, LLM integration, API gateway patterns, Docker, Kubernetes, Helm, observability, alerting, PII detection, rate limiting, audit logging, multi-tenancy, and load testing.
+
+The lesson that connects all of these is the difference between "code that works" and "code that is ready for production."
+
+Code that works passes its unit tests and does the right thing in the happy path. Code that is production-ready handles partial failures gracefully (what happens when Kafka is temporarily unavailable? when Qdrant returns an error? when the LLM call times out?), generates the telemetry that makes failures visible, degrades gracefully under load rather than cascading to total failure, logs enough information to diagnose a problem that occurred at 3 AM last Tuesday, and never leaks one customer's data to another.
+
+The audit log's async-with-separate-transaction design, the PII detector's fallback on ImportError, the rate limiter's `anonymous` fallback key, the `wait_for_processing` timeout in the E2E tests — all of these are examples of that mindset applied at the code level. Every defensive choice you have seen in this codebase exists because the alternative was a failure mode that would be bad for a real user.
+
+This is what distinguishes engineers who build systems that stay running from engineers who build systems that need constant rescue.
+
 Each message in the conversation is a local React state object. The conversation is not persisted to the backend — if the user refreshes, it clears. Persisting conversation history would require a new database table and is a reasonable future enhancement, but it adds complexity and is not necessary for the core use case.

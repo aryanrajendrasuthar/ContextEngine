@@ -1,0 +1,70 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowledge-graph-service
+  namespace: contextengine
+  labels:
+    app.kubernetes.io/name: knowledge-graph-service
+    app.kubernetes.io/part-of: contextengine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: knowledge-graph-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: knowledge-graph-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8085"
+    spec:
+      containers:
+        - name: knowledge-graph-service
+          image: contextengine/knowledge-graph-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8085
+          envFrom:
+            - configMapRef:
+                name: contextengine-config
+            - secretRef:
+                name: contextengine-secrets
+          env:
+            - name: SERVER_PORT
+              value: "8085"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8085
+            initialDelaySeconds: 45
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8085
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowledge-graph-service
+  namespace: contextengine
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: knowledge-graph-service
+  ports:
+    - port: 8085
+      targetPort: 8085
+      protocol: TCP

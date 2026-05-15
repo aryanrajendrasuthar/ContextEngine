@@ -1,0 +1,15 @@
+
+apiVersion: v2
+name: contextengine
+description: Enterprise knowledge intelligence platform — RAG-powered Q&A over your organization's data
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - rag
+  - knowledge-graph
+  - enterprise-ai
+  - search
+home: https://github.com/contextengine/contextengine
+maintainers:
+  - name: ContextEngine Engineering

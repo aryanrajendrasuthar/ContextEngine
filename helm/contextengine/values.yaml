@@ -1,0 +1,174 @@
+
+# ContextEngine Helm Chart — default values
+# Override these in a values-production.yaml file. Never commit secrets.
+
+global:
+  namespace: contextengine
+  image:
+    registry: contextengine
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# Shared infrastructure endpoints (in-cluster service names)
+config:
+  kafka:
+    bootstrapServers: kafka:9092
+  redis:
+    host: redis
+    port: "6379"
+  database:
+    url: jdbc:postgresql://postgresql:5432/contextengine
+  neo4j:
+    uri: bolt://neo4j:7687
+    username: neo4j
+  qdrant:
+    host: qdrant
+    port: "6333"
+  ollama:
+    baseUrl: http://ollama:11434
+    embeddingModel: nomic-embed-text
+    chatModel: llama3.1:8b
+    timeoutSeconds: "60"
+  cors:
+    allowedOrigins: https://app.contextengine.io
+  piiDetectionEnabled: "true"
+  logLevel: INFO
+
+# Sensitive values — override via --set or a sealed-secrets file, never in plain values.yaml
+secrets:
+  jwtSecret: "REPLACE_WITH_STRONG_SECRET"
+  databaseUsername: contextengine
+  databasePassword: "REPLACE_WITH_DB_PASSWORD"
+  neo4jPassword: "REPLACE_WITH_NEO4J_PASSWORD"
+  qdrantApiKey: ""
+
+# Per-service configuration
+services:
+  gateway:
+    port: 8080
+    replicas: 2
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    healthPath: /actuator/health
+
+  user-service:
+    port: 8081
+    replicas: 2
+    hpa:
+      enabled: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    healthPath: /actuator/health
+
+  ingestion-service:
+    port: 8082
+    replicas: 2
+    hpa:
+      enabled: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    healthPath: /actuator/health
+
+  connector-service:
+    port: 8083
+    replicas: 1
+    hpa:
+      enabled: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 768Mi
+    healthPath: /actuator/health
+
+  query-service:
+    port: 8084
+    replicas: 2
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+    resources:
+      requests:
+        cpu: 300m
+        memory: 768Mi
+      limits:
+        cpu: 1500m
+        memory: 2Gi
+    healthPath: /actuator/health
+
+  knowledge-graph-service:
+    port: 8085
+    replicas: 1
+    hpa:
+      enabled: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    healthPath: /actuator/health
+
+  embedding-service:
+    port: 8086
+    replicas: 1
+    hpa:
+      enabled: false
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+    healthPath: /health
+
+  frontend:
+    port: 80
+    replicas: 2
+    hpa:
+      enabled: false
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    healthPath: /
+
+ingress:
+  enabled: true
+  className: nginx
+  host: app.contextengine.io
+  tls:
+    enabled: false
+    secretName: contextengine-tls
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
