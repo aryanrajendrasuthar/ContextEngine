@@ -4,27 +4,28 @@ import os
 import httpx
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from kafka import KafkaAdminClient
+from kafka.errors import KafkaError
 from qdrant_client import QdrantClient
-from qdrant_client.http.exceptions import UnexpectedResponse
 
 router = APIRouter()
 
 
 @router.get("/health")
 async def health():
-    status = {"service": "embedding-service", "status": "up", "checks": {}}
+    checks = {}
 
-    qdrant_ok = await _check_qdrant()
-    status["checks"]["qdrant"] = "up" if qdrant_ok else "down"
+    checks["qdrant"] = "up" if await _check_qdrant() else "down"
+    checks["ollama"] = "up" if await _check_ollama() else "down"
+    checks["kafka"] = "up" if _check_kafka() else "down"
 
-    ollama_ok = await _check_ollama()
-    status["checks"]["ollama"] = "up" if ollama_ok else "down"
+    all_up = all(v == "up" for v in checks.values())
+    overall = "up" if all_up else "degraded"
 
-    overall = "up" if qdrant_ok and ollama_ok else "degraded"
-    status["status"] = overall
-
-    http_status = 200 if overall == "up" else 503
-    return JSONResponse(content=status, status_code=http_status)
+    return JSONResponse(
+        content={"service": "embedding-service", "status": overall, "checks": checks},
+        status_code=200 if all_up else 503,
+    )
 
 
 async def _check_qdrant() -> bool:
@@ -46,5 +47,18 @@ async def _check_ollama() -> bool:
         async with httpx.AsyncClient(timeout=5) as client:
             response = await client.get(f"{ollama_url}/api/tags")
             return response.status_code == 200
+    except Exception:
+        return False
+
+
+def _check_kafka() -> bool:
+    bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
+    try:
+        admin = KafkaAdminClient(bootstrap_servers=bootstrap, request_timeout_ms=3000)
+        admin.list_topics()
+        admin.close()
+        return True
+    except KafkaError:
+        return False
     except Exception:
         return False

@@ -1,12 +1,14 @@
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app.health import router as health_router
+from app.kafka_consumer import run_consumer, stop_consumer
 
 logging.basicConfig(
     level=logging.getLevelName(os.getenv("LOG_LEVEL", "INFO")),
@@ -18,8 +20,21 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     logger.info("Starting ContextEngine embedding-service")
+
+    consumer_thread = threading.Thread(
+        target=run_consumer,
+        name="kafka-consumer",
+        daemon=True,
+    )
+    consumer_thread.start()
+    logger.info("Kafka consumer thread started")
+
     yield
-    logger.info("Shutting down ContextEngine embedding-service")
+
+    logger.info("Shutting down embedding-service — signalling consumer to stop")
+    stop_consumer()
+    consumer_thread.join(timeout=10)
+    logger.info("Embedding-service shutdown complete")
 
 
 app = FastAPI(

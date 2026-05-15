@@ -231,3 +231,81 @@ The critical insight about mocking is that mocks do not test integration — the
 Full integration tests (using Testcontainers) spin up real Docker containers for PostgreSQL and Kafka. These are the tests that catch configuration errors, Flyway migration problems, and query bugs that mocks cannot detect. They are slower (seconds, not milliseconds) and are run less frequently — typically in CI, not on every local code change.
 
 The combination of all three test types gives you confidence at different levels: unit tests that your logic is correct, slice tests that your HTTP API is correct, and integration tests that the whole stack wires together correctly in a real environment.
+
+---
+
+## Sprint 3: Embedding Pipeline and Vector Search
+
+### Why raw text is not searchable and what embeddings fix
+
+The ingestion service stores events in PostgreSQL as raw text. You could search that text using PostgreSQL's `ILIKE` operator or full-text search. The problem is that these approaches only find documents that share the exact same words as the query.
+
+A developer asks: "How do we handle database connection exhaustion?" The relevant document says: "When all HikariCP pool slots are occupied, new requests queue and eventually timeout. Use PgBouncer in transaction mode to multiplex connections." There is no word overlap between the query and the document — "database connection exhaustion" does not appear literally in the document. A keyword search returns nothing. A semantic search returns the document immediately.
+
+Embeddings solve this by converting text into a point in a mathematical space where meaning determines proximity. When you embed "database connection exhaustion" and "HikariCP pool slots occupied", the two vectors end up close together because they were trained on text where these concepts appear in related contexts. Cosine similarity — the angle between the two vectors — is close to zero, meaning the documents are semantically similar.
+
+The embedding model (nomic-embed-text, running locally via Ollama) converts any text string to a 768-dimensional vector. A 768-dimensional vector is a list of 768 floating point numbers, each between -1 and 1. The model has 137 million parameters trained to produce vectors where this semantic proximity property holds. You do not need to understand the model internals to use it — you only need to know that it maps semantically similar text to nearby vectors.
+
+### What chunking is and why it matters
+
+A language model has a maximum input length — a context window. nomic-embed-text accepts at most 8,192 tokens per call. A long Slack thread or detailed GitHub PR description might be 4,000 words, which is well within the limit. But the embedding of a 4,000-word document captures the average meaning of the entire document, which may be too diffuse to match a specific question about one detail in that document.
+
+Chunking splits long documents into smaller overlapping segments — in ContextEngine, 512 tokens per chunk with 50-token overlap. Each chunk gets its own embedding, which represents a focused portion of the original document.
+
+The 50-token overlap is critical. Without overlap, a sentence that is split across a chunk boundary would be half-embedded in each adjacent chunk. Neither chunk's embedding would capture the complete thought. With 50-token overlap, the end of chunk N appears again at the beginning of chunk N+1, so every sentence is fully represented in at least one chunk.
+
+Chunk size is a tunable parameter. Smaller chunks (128 tokens) are more precise but lose context — a chunk containing only "it was rejected" with no surrounding explanation is useless. Larger chunks (1024 tokens) preserve more context but produce broader embeddings that match less specifically. 512 tokens is a widely-used default that balances precision and context.
+
+The tiktoken library provides accurate token counting using the same tokenization algorithm as the embedding model. This matters because a "token" is not a word — it is a subword unit. "PostgreSQL" might be one or two tokens depending on the tokenizer. Splitting on word count would produce inconsistently sized chunks; splitting on token count produces chunks that respect the model's actual input units.
+
+### How Qdrant stores and retrieves embeddings
+
+Qdrant is a purpose-built vector database. It stores each embedding as a "point" — a vector plus an arbitrary JSON payload. The payload is stored alongside the vector and returned in search results, so you do not need to make a second database query to get the full document after finding a match.
+
+ContextEngine uses one Qdrant collection per organization. This enforces tenant isolation at the data layer: a search against `org_acme` can never return results from `org_beta`, regardless of how similar their embeddings are. Creating one collection per organization also allows the vector index to remain small — HNSW performance degrades gracefully with size but benefits from smaller graphs — and allows collections to be deleted cleanly when an organization offboards.
+
+Each point's ID is a deterministic UUID5 computed from the source event ID and chunk index. This makes upserts idempotent: if the same event is processed twice (due to a consumer restart or a Kafka redelivery), the second run produces the same point IDs and overwrites the existing points rather than creating duplicates. This is the vector store equivalent of the deduplication strategy in the ingestion service.
+
+The HNSW index (Hierarchical Navigable Small World) is a graph-based approximate nearest neighbor algorithm. It builds a multi-layer graph where each node is connected to its nearest neighbors at different scales. A query traverses this graph, starting from a broad view and narrowing down to the nearest vectors. This finds the closest matches in O(log n) time, making searches over millions of vectors feasible at low latency.
+
+### The role of the dead letter queue
+
+In a processing pipeline, some events will always fail. The embedding model might be temporarily unavailable. A document might contain content that causes the embedding API to return an error. The Qdrant write might fail due to a network partition.
+
+A naive consumer would retry indefinitely, blocking the pipeline. An equally naive consumer would skip failures silently, losing data.
+
+The dead letter queue (DLQ) is the correct solution. When an event fails processing after retries, it is published to `contextengine.knowledge.errors` with a structured record explaining why it failed: the source ID, the failure reason, the timestamp, and a preview of the content. The consumer then commits the Kafka offset and moves on. The pipeline does not stall.
+
+The DLQ serves two purposes. First, it is an audit trail: you can query the errors topic to understand what failed, when, and why, without the failures being silently dropped. Second, it is a reprocessing queue: if the failure was due to a temporary outage (Ollama was restarting), an operator can replay the DLQ events once the system is healthy.
+
+The key insight is that not all errors are equal. A malformed event (unparseable JSON, missing required fields) will never succeed no matter how many times it is retried — commit immediately and move on. A transient network error (Ollama timed out) might succeed on retry — try up to three times with exponential backoff before giving up and sending to the DLQ. The tenacity retry library implements this distinction: `retry_if_exception_type` specifies which exception types trigger a retry, and everything else fails immediately.
+
+### Why the consumer is synchronous in an async service
+
+The embedding service is built on FastAPI, which is an async framework. FastAPI handles HTTP requests in an asyncio event loop. However, kafka-python — the Kafka client library used here — is synchronous. Its consumer poll loop is a blocking call.
+
+Mixing synchronous blocking calls with asyncio is dangerous. If you call a blocking function from an async function without special handling, you block the entire event loop — all HTTP requests, all health checks, everything freezes until the blocking call returns.
+
+The solution is to run the Kafka consumer in a separate operating system thread, completely outside the asyncio event loop. The consumer thread blocks freely in its poll loop, while FastAPI continues handling HTTP requests in the event loop thread. The two threads share no mutable state — the consumer thread only reads from Kafka and writes to Qdrant and back to Kafka.
+
+This architecture pattern (async web layer + sync worker thread) is common in Python services that need to mix synchronous and asynchronous work. An alternative would be to use an async Kafka client (aiokafka) and run everything in the event loop, but that adds complexity and the synchronous approach is perfectly adequate for a single-consumer service.
+
+### What the processed topic carries and why it matters
+
+After successfully embedding an event, the embedding service publishes to `contextengine.knowledge.processed`. This is not just a notification that "event X was processed." It carries the complete original event fields plus the list of Qdrant point IDs created.
+
+The knowledge-graph-service (built in Sprint 4) reads from this topic. It needs:
+- The original event fields (source type, author, timestamp, URL) to create Neo4j nodes for the Person, Document, and Concept entities
+- The Qdrant point IDs so the Document node in Neo4j can reference which vectors represent it in the vector store
+
+Publishing the enriched event to a separate topic rather than polling a database is the event-driven pattern working as intended: the embedding service is the authority on what was embedded, and it broadcasts that fact. Any service that cares — now or in the future — subscribes to the processed topic. No polling, no tight coupling, no shared database queries between services.
+
+### Performance fundamentals for vector search
+
+There are three performance characteristics that matter in a vector search system, and understanding them helps you make informed trade-offs.
+
+**Recall vs. latency.** HNSW is an approximate nearest neighbor algorithm — it finds very good matches, but not guaranteed-exact matches. The `ef` parameter controls the tradeoff: higher `ef` means the algorithm explores more of the graph and finds more accurate results, but takes longer. For a knowledge retrieval system, 95% recall at 20ms latency is better than 99% recall at 200ms latency — users will not notice if one occasionally relevant document is missed, but they will notice slow responses.
+
+**Embedding latency.** On a local machine without a GPU, Ollama takes 50-200ms to produce one embedding using the CPU. This is acceptable for offline batch processing (the Kafka consumer) but would be unacceptable for real-time query handling. Sprint 4's query service will call Ollama to embed the user's question before searching Qdrant. On a machine with a modern GPU, this drops to under 5ms.
+
+**Index build vs. query.** Qdrant builds the HNSW graph incrementally as points are upserted. Adding points is slower when the index is large because the graph must be reconnected. This is why search performance degrades gracefully (logarithmic) but indexing throughput decreases as the collection grows. For a knowledge base that is mostly read (queries) rather than written (indexing), this is a favorable tradeoff.
