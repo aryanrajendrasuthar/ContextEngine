@@ -1,0 +1,59 @@
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: contextengine
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
+
+  - job_name: gateway
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - gateway:8080
+
+  - job_name: user-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - user-service:8081
+
+  - job_name: ingestion-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - ingestion-service:8082
+
+  - job_name: connector-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - connector-service:8083
+
+  - job_name: query-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - query-service:8084
+
+  - job_name: knowledge-graph-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - knowledge-graph-service:8085
+
+  - job_name: embedding-service
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - embedding-service:8086
+
+  - job_name: kafka
+    static_configs:
+      - targets:
+          - kafka:9092
