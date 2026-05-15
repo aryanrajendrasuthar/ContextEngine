@@ -24,12 +24,15 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: true
+    table: flyway_schema_history_connector
 
 ingestion:
   service:
     url: ${INGESTION_SERVICE_URL:http://localhost:8082}
 
 connectors:
+  scheduler:
+    interval-ms: ${CONNECTOR_SCHEDULER_INTERVAL_MS:60000}
   github:
     api-url: ${GITHUB_API_URL:https://api.github.com}
     token: ${GITHUB_TOKEN:}
@@ -43,6 +46,24 @@ connectors:
     username: ${JIRA_USERNAME:}
     token: ${JIRA_TOKEN:}
     poll-interval-seconds: ${JIRA_POLL_INTERVAL:300}
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      ingestion-service:
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        register-health-indicator: true
+  retry:
+    instances:
+      ingestion-service:
+        max-attempts: 3
+        wait-duration: 2s
+        retry-exceptions:
+          - org.springframework.web.reactive.function.client.WebClientRequestException
 
 management:
   endpoints:

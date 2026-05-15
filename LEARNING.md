@@ -120,3 +120,114 @@ This work happens in system design documents (like `docs/architecture/system-des
 The documentation serves multiple purposes: it aligns the team on the approach before anyone invests weeks building in the wrong direction; it creates a record that new team members can read to understand context; and it forces the architect to think through details that would otherwise be discovered as bugs in production.
 
 This is exactly what Sprint 1 of ContextEngine represents. The code written in Sprint 1 is all skeleton code — runnable but empty. The real deliverable is the shared understanding of what is being built and why, recorded in files that will outlast the engineers who wrote them.
+
+---
+
+## Sprint 2: Ingestion Pipeline and Connector Framework
+
+### What the ingestion service actually does and why it exists
+
+Every piece of organizational knowledge — a GitHub pull request, a Slack message, a Jira ticket — enters the system through the ingestion service. Its job is narrow and specific: receive an event, verify it has not been seen before, persist it, and publish it to Kafka so downstream services can process it asynchronously.
+
+This narrow focus is deliberate. The ingestion service knows nothing about embeddings, knowledge graphs, or answers. It only ensures that every event is validated, deduplicated, persisted, and forwarded exactly once. Each of those responsibilities is a meaningful engineering problem on its own.
+
+Separation of concerns is not just an academic principle. In practice it means that if the embedding service is slow or offline, events pile up in Kafka rather than being lost. If the ingestion service crashes and restarts, it picks up where it left off without data loss. If you need to replay events through the embedding pipeline, you replay from Kafka without touching the ingestion service. Each component can be scaled, debugged, and deployed independently.
+
+### Content deduplication: why you need two layers
+
+The ingestion service implements deduplication at two independent layers: Redis and PostgreSQL.
+
+The Redis layer is fast. It keeps a SHA-256 hash of each ingested event's content in memory with a 24-hour TTL. When a new event arrives, the service computes its hash and checks Redis before touching the database. If the hash is found, the event is rejected immediately — the database is not consulted at all. For a system that might receive thousands of events per minute from connectors that retry on failure, this in-memory check is what keeps the database from being overwhelmed with duplicate lookups.
+
+The PostgreSQL layer is authoritative. It stores a unique index on `(organization_id, source_id)`, which is the unique identifier of an event within its source system (a pull request number, a Jira ticket key, a Slack message timestamp). This check handles the case where the Redis cache has expired but the event was processed long ago. It is also the source of truth if Redis is restarted and loses its in-memory state.
+
+This is a standard pattern in high-throughput systems: fast approximate filter in front of a slower authoritative store. Neither layer alone is sufficient. Redis alone loses state on restart. PostgreSQL alone is too slow under load. Together, the system is both fast and correct.
+
+The SHA-256 hash is computed from the event's content string, not its identifier. This detects cases where the same source event is re-submitted with a different identifier but identical content — something that happens in practice with connectors that generate new IDs on retry.
+
+### What Kafka provides that a direct HTTP call cannot
+
+When the ingestion service accepts an event, it needs to notify downstream services — the embedding service, the knowledge graph service — that new work is available. The naive approach is a direct HTTP call: when an event arrives, immediately POST it to the embedding service. This fails in production for three reasons.
+
+First, tight coupling. If the embedding service is down or overloaded, the ingestion service's request fails. You either drop the event (data loss) or block and retry (backpressure that can cascade into the ingestion service becoming unavailable too).
+
+Second, no replay. If you need to re-embed all events after upgrading the embedding model, you have no way to replay them. The events were consumed and are gone.
+
+Third, no ordering guarantees. You cannot ensure that events for the same organization are processed in sequence, which matters for correctness when building incremental graph structures.
+
+Kafka solves all three. The ingestion service publishes an event to a Kafka topic and immediately returns — it does not wait for downstream processing. Kafka stores the event durably on disk and retains it for a configurable period. Downstream consumers read at their own pace, restart from any point in the log, and process events in partition order. The partition key (organization ID) ensures that all events for a given organization land on the same partition, preserving ordering.
+
+At ContextEngine, an event published to Kafka gets embedded, stored in Qdrant, and represented in the Neo4j knowledge graph — three entirely independent processes, all driven by the same immutable log entry. Adding a fourth downstream processor in the future requires only a new Kafka consumer, with no changes to the ingestion service or the existing processors.
+
+### What idempotency means and why it matters for distributed systems
+
+Idempotency means: performing an operation multiple times produces the same result as performing it once. An idempotent HTTP endpoint is one where making the same request twice is safe — the second request is a no-op rather than creating a duplicate.
+
+In distributed systems, you cannot assume that a request was received exactly once. Networks drop packets. Services restart mid-request. Load balancers time out and retry. The practical reality is that any operation may be attempted two, three, or four times by the time the originating caller gives up or receives a success response.
+
+The ingestion service handles this correctly. If the same event is submitted twice — same `sourceId` and same content — the second submission returns HTTP 200 with a `DUPLICATE` result. No second record is created, no second Kafka message is published. The service is safe to retry without consequences.
+
+This is why the deduplication logic is part of the ingestion service rather than being the caller's responsibility. You cannot trust that every caller will deduplicate correctly. The service must protect its own invariants.
+
+Kafka producers in this system are also configured as idempotent producers (the `enable.idempotence=true` setting). This means Kafka guarantees that even if the producer retries a message delivery due to a network timeout, the broker will store the message exactly once. Without this setting, a producer retry would create a duplicate message in the topic.
+
+### The plugin architecture for connectors
+
+The connector service needs to integrate with multiple source systems — GitHub, Slack, Jira, webhooks, and more — each with a completely different API. A naive approach would be a large switch statement that hard-codes the integration logic for each source type.
+
+The plugin architecture inverts this. A `ConnectorInterface` defines the contract: `fetchEvents(config, since)` and `testConnection(config)`. Every source system gets its own class that implements this interface. The `ConnectorRegistry` uses Spring's dependency injection to automatically collect all classes that implement `ConnectorInterface` and register them in a map keyed by connector type.
+
+```
+ConnectorRegistry
+  │
+  ├── GitHubConnector  (GITHUB)
+  ├── SlackConnector   (SLACK)
+  ├── JiraConnector    (JIRA)
+  └── WebhookConnector (WEBHOOK)
+```
+
+Adding a new connector type — say, Confluence — requires creating exactly one new Java class that implements `ConnectorInterface` and annotating it with `@Component`. The registry picks it up automatically. No configuration changes, no switch statements, no modifications to existing code.
+
+This is the Open/Closed Principle in practice: the system is open for extension (new connector types) but closed for modification (no existing code changes when you add one). It is also why Spring's IoC container is so powerful in real systems — it turns adding a feature from a modification task into a creation task.
+
+### How the scheduler drives periodic synchronization
+
+The `ConnectorScheduler` runs on a fixed delay (default: every 60 seconds). It queries the database for all connectors in `ACTIVE` status and calls `fetchEvents` on each one, passing the timestamp of the last successful sync as the `since` parameter. This means each sync only retrieves events created or updated since the previous run — not the entire history.
+
+The pattern `config.getLastSyncAt() != null ? config.getLastSyncAt() : Instant.now().minus(30, DAYS)` is an example of a sensible default. A connector that has never run before needs a starting point. Defaulting to 30 days back is a practical choice: it captures recent history without overwhelming the pipeline on first run.
+
+After a successful sync, the connector's status is set to `ACTIVE`, `lastSyncAt` is updated to the current time, and `documentsIndexed` is incremented by the number of events forwarded. If the sync fails — whether due to a network error, a rate limit, or an unexpected exception — the connector is marked `ERROR` and the failure message is stored. The scheduler will skip `ERROR` connectors on subsequent runs unless an operator reactivates them.
+
+This approach means a single failing connector cannot crash the scheduler. Each connector's sync is wrapped in a try-catch that logs the error, marks the connector, and moves on to the next one.
+
+### How the circuit breaker protects the system
+
+When the connector-service calls the ingestion-service via HTTP, it does so through a Resilience4j circuit breaker. A circuit breaker is a pattern borrowed from electrical engineering: when too many failures occur in a short period, the circuit "opens" and subsequent calls fail immediately without even attempting the HTTP request. After a configurable wait period, the circuit enters a "half-open" state and allows a few test requests through. If those succeed, the circuit closes and normal operation resumes.
+
+Without a circuit breaker, a slow or unavailable ingestion-service causes connector sync threads to pile up waiting for HTTP timeouts. Each thread holds a database connection, a memory allocation, and a scheduled task slot. Enough of them, and the connector-service runs out of resources and goes offline too. One failing downstream service cascades into total system failure — this is called a cascade failure, and it is one of the most common causes of production outages.
+
+With the circuit breaker, after five failures in a ten-request window, the connector-service stops trying to reach the ingestion-service for 30 seconds. Events are dropped during the open period (logged, not silently discarded), but the connector-service stays healthy. When the ingestion-service recovers, the circuit closes automatically and normal operation resumes with no human intervention required.
+
+### Webhooks: why push beats pull for real-time integrations
+
+The scheduler-based connectors (GitHub, Slack, Jira) work by polling: every 60 seconds, ask the source system "what has changed since I last checked?" This is simple and reliable but has two drawbacks: latency (up to 60 seconds before a new event is ingested) and unnecessary API calls (60 calls per hour even when nothing has changed).
+
+Webhooks invert the model. Instead of ContextEngine asking the source system for changes, the source system calls ContextEngine when changes occur. GitHub can be configured to send an HTTP POST to ContextEngine's `/api/v1/webhooks/{connectorId}` endpoint within seconds of a pull request being merged.
+
+The tradeoff is that webhooks require the receiving service to be publicly accessible (a source system cannot POST to `localhost`) and require the source system to support webhooks (not all do). Polling works everywhere, even in isolated environments with no public endpoint.
+
+In production, both models coexist: polling for systems that don't support webhooks, and webhooks for systems that do, with polling as a fallback or catch-up mechanism. The connector architecture supports both through the same `ConnectorInterface` — a webhook connector's `fetchEvents` simply returns an empty list, because events arrive through the HTTP endpoint instead.
+
+### What tests are actually testing
+
+Sprint 2 introduced the first real test suites. It is worth being explicit about what each type of test is checking.
+
+Unit tests (like `IngestionServiceTest`) test a single class in complete isolation. Every dependency is replaced with a mock — a fake object that you control. The test asks: "given that my dependencies behave in a specific way, does this class behave correctly?" Unit tests run in milliseconds, have no external dependencies (no database, no network), and tell you precisely which class is broken when they fail.
+
+Controller slice tests (like `IngestionControllerIntegrationTest` using `@WebMvcTest`) test the HTTP layer of the application: routing, request deserialization, response serialization, and validation annotations. Spring boots only the web layer, not the full application context. The service layer is mocked. These tests verify that HTTP contracts — status codes, request body validation, JSON field names — are correct.
+
+The critical insight about mocking is that mocks do not test integration — they test behavior under controlled conditions. The test `kafkaFailure_marksEntityAsFailed` would be impossible to write reliably with a real Kafka broker because you would need to somehow force a broker failure at the right moment. With a mock, you simply tell the mock Kafka service to return a failed CompletableFuture, and the test verifies that the entity is marked FAILED in response.
+
+Full integration tests (using Testcontainers) spin up real Docker containers for PostgreSQL and Kafka. These are the tests that catch configuration errors, Flyway migration problems, and query bugs that mocks cannot detect. They are slower (seconds, not milliseconds) and are run less frequently — typically in CI, not on every local code change.
+
+The combination of all three test types gives you confidence at different levels: unit tests that your logic is correct, slice tests that your HTTP API is correct, and integration tests that the whole stack wires together correctly in a real environment.
