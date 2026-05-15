@@ -387,3 +387,158 @@ When the embedding service publishes to `contextengine.knowledge.processed`, it 
 This means the two services can fail independently. If the knowledge-graph-service is down for an hour, the embedding service continues processing and publishing to Kafka. When the graph service restarts, it reads from the offset where it left off and catches up. No data is lost, no coordination is required, and neither service needs to know the other exists.
 
 This property — where services communicate only through durable, replayable event logs rather than direct calls — is what makes the system resilient to partial failures in production.
+
+---
+
+## Sprint 5: Authentication, User Management, and the Frontend
+
+Sprint 5 is where the system becomes usable by humans. Until now everything required direct API calls with tools like curl or Postman. Sprint 5 adds a user-service that issues JWT tokens, and a React frontend with seven pages that let a non-technical user query the knowledge base, explore the graph, and manage their account.
+
+### What stateless authentication means and why it matters
+
+Every HTTP request to a web server must include enough information for the server to answer the question: who is this person and are they allowed to do this? There are two classic approaches.
+
+The first is session-based authentication. The server stores a session object in memory or a database. When a user logs in, the server creates a session, assigns it an ID, and sends that ID to the browser in a cookie. On every subsequent request, the browser sends the cookie, the server looks up the session ID, retrieves the session, and knows who the user is. The problem: this creates server-side state. If you run three instances of the server for load balancing, all three need access to the same session store, which requires a shared external cache like Redis. The server cannot be truly stateless.
+
+The second is token-based authentication. The server creates a self-contained token when the user logs in and signs it cryptographically. The token contains the user's ID, role, organization, and an expiry time — all the information the server needs. On every subsequent request, the browser includes this token. The server verifies the cryptographic signature (proving it created the token and it hasn't been tampered with), then reads the payload directly — no database lookup required. Any server instance can verify any token independently. This is stateless.
+
+JWT (JSON Web Token) is the standard format for these tokens. A JWT has three base64-encoded parts separated by dots: header (algorithm used), payload (the claims), and signature. The signature is computed with HMAC-SHA256 using a secret key that only the server knows. Verifying a JWT means recomputing the signature and checking it matches — a microsecond operation compared to a database round-trip.
+
+The user-service uses two tokens. The access token is short-lived (15 minutes) and is what the client sends with every API request. The refresh token is long-lived (30 days) and is used only to get a new access token when the access token expires. Refresh tokens are stored in Redis: this gives the server a way to revoke them (by deleting the Redis entry) without needing to track every access token.
+
+### How the JWT filter works in the Spring Security chain
+
+Spring Security works as a chain of filters that wrap every incoming HTTP request. Each filter can examine the request, modify it, pass it to the next filter, or short-circuit the chain and send a response. The JWT filter is placed before Spring's `UsernamePasswordAuthenticationFilter`.
+
+When a request arrives at `JwtAuthenticationFilter`:
+
+1. It checks for an `Authorization: Bearer <token>` header. If there is none, it passes the request down the chain without setting any authentication — the request proceeds unauthenticated. Spring Security's authorization rules decide whether that is acceptable for the requested endpoint.
+
+2. If a Bearer token is present, it calls `jwtService.isTokenValid(token)`. This verifies the cryptographic signature and checks the expiry date. If the token is invalid or expired, the filter again passes the request down the chain without authentication.
+
+3. If the token is valid, it extracts the subject (user UUID), loads the user from the database, and creates a `UsernamePasswordAuthenticationToken` — Spring's way of representing an authenticated principal. It places this in the `SecurityContextHolder`, which is a thread-local storage that holds the authentication for the duration of the request.
+
+4. The filter always calls `filterChain.doFilter()` at the end, passing control to the next filter regardless of authentication outcome.
+
+Downstream, `SecurityConfig` defines which routes require authentication. Routes under `/api/v1/auth/**` are public. Everything else requires authentication — and because we set the session policy to `STATELESS`, Spring never creates an HTTP session; it relies entirely on the token being present in each request.
+
+### Why JJWT uses a builder pattern and what the 0.12.x API looks like
+
+JJWT is the most widely used Java JWT library. Version 0.12.x introduced a fluent API that is cleaner than the older 0.9.x API that most tutorials still show. If you're copying code from Stack Overflow, be careful: the old API used methods like `setSubject()`, `setExpiration()`, `setIssuedAt()`, and `signWith(key, algorithm)`. These were renamed in 0.12.x.
+
+The new API:
+```java
+Jwts.builder()
+    .subject(userId)             // was .setSubject(userId)
+    .claim("role", role)
+    .issuedAt(new Date())        // was .setIssuedAt(new Date())
+    .expiration(expiryDate)      // was .setExpiration(expiryDate)
+    .signWith(secretKey)         // was .signWith(key, algorithm) — algorithm now inferred from key length
+    .compact()
+```
+
+For parsing:
+```java
+Jwts.parser()
+    .verifyWith(secretKey)       // was .setSigningKey(key)
+    .build()
+    .parseSignedClaims(token)    // was .parseClaimsJws(token)
+    .getPayload()                // was .getBody()
+```
+
+The secret key is derived from the secret string using `Keys.hmacShaKeyFor(secret.getBytes(UTF_8))`. JJWT selects HMAC-SHA256, SHA384, or SHA512 automatically based on the key length. A secret of 32+ bytes gives SHA256, which is appropriate for most applications.
+
+### BCrypt and why you never store plain passwords
+
+BCrypt is a password hashing function designed specifically for passwords. Unlike general-purpose cryptographic hash functions like SHA-256, BCrypt is intentionally slow and includes a "cost factor" that can be increased over time as hardware gets faster. A SHA-256 hash of a password takes nanoseconds to compute — an attacker can test billions of passwords per second against a stolen hash. A BCrypt hash with cost factor 10 takes roughly 100ms to compute — the same attacker can only test ten passwords per second.
+
+BCrypt also incorporates a random "salt" that is stored alongside the hash. Even if two users have the same password, their BCrypt hashes are different. This prevents rainbow table attacks (precomputed tables of hash-to-password mappings).
+
+Spring Security's `BCryptPasswordEncoder` handles all of this automatically. `encoder.encode(rawPassword)` computes and returns the hash including its embedded salt. `encoder.matches(rawPassword, storedHash)` extracts the salt from the stored hash, recomputes, and compares — you never see the intermediate steps.
+
+The one property you must internalize: BCrypt is a one-way function. There is no `decoder.decode(hash)`. The user-service never recovers plain passwords. If a user forgets their password, the only recourse is to reset it (generate a new one or email a reset link). This is the correct behavior — the server should not know users' passwords.
+
+### The organization-first registration model
+
+When a user registers, the user-service creates two entities: an Organization and a User. The registering user becomes the ADMIN of that organization. Subsequent team members would be invited (not implemented in this sprint but architecturally prepared — the users table has an organization_id foreign key and users can be added to an existing org).
+
+The slug is derived from the organization name. "Acme Corp" becomes "acme-corp". If "acme-corp" already exists, the next registration gets "acme-corp-2". This slug is not used in the UI but is useful for logging and for any future multi-tenant subdomain routing.
+
+All data in every service is scoped to organizationId. The query-service uses it as the collection name in Qdrant. The knowledge-graph-service stores it as a property on every node. The ingestion-service deduplicates within an org. This means the system can safely serve multiple organizations from a single deployment — their data never mixes.
+
+### React Query and why it replaces useEffect + useState for data fetching
+
+A common React antipattern for fetching data looks like this:
+
+```typescript
+const [data, setData] = useState(null)
+const [loading, setLoading] = useState(false)
+const [error, setError] = useState(null)
+
+useEffect(() => {
+  setLoading(true)
+  fetch('/api/data')
+    .then(res => res.json())
+    .then(setData)
+    .catch(setError)
+    .finally(() => setLoading(false))
+}, [])
+```
+
+This has subtle bugs: no deduplication (if two components fetch the same endpoint, two requests go out), no caching (every mount refetches), no background revalidation, and race conditions if the component unmounts before the fetch completes.
+
+`@tanstack/react-query` solves all of this. `useQuery({ queryKey: ['connectors'], queryFn: ... })` deduplicates identical queries, caches results keyed by `queryKey`, automatically retries on failure, and provides `isLoading`, `isError`, and `data` as a clean interface. `useMutation` provides the same experience for write operations with `onSuccess` and `onError` callbacks.
+
+The `queryClient.invalidateQueries({ queryKey: ['connectors'] })` pattern in mutation `onSuccess` is the correct way to trigger a re-fetch after a write — it marks the cached data as stale and React Query automatically refetches it on the next render.
+
+### Zustand and why it beats Redux for small global state
+
+Redux is the historically dominant React state management library. It is comprehensive, debuggable, and scales to very large applications. It is also verbose: actions, action creators, reducers, selectors, middleware, and a Provider wrapper add significant boilerplate for simple state like "is the user logged in?".
+
+Zustand provides a minimal store with no boilerplate. The entire auth store in this project is one `create()` call with state fields and two methods. The `persist` middleware wraps it to automatically serialize state to `localStorage` — which is how the user stays logged in across page refreshes.
+
+One important pattern in this codebase: the API client (axios) accesses the Zustand store directly via `useAuthStore.getState()` rather than using React's `useContext` hook. `useAuthStore.getState()` works outside of React components, which is necessary inside Axios interceptors that run outside the React render cycle.
+
+### The difference between authentication and authorization
+
+These terms are often conflated. They are different:
+
+Authentication answers "who are you?" The JWT filter handles this. It verifies the token, loads the user, and places them in the SecurityContext. After this step, Spring knows the identity of the caller.
+
+Authorization answers "are you allowed to do this?" Spring Security's `authorizeHttpRequests` handles this. In the current configuration, any authenticated user can access any protected endpoint — the only distinction is authenticated vs. unauthenticated. As the system grows, you would add method-level security: `@PreAuthorize("hasRole('ADMIN')")` on endpoints that only org admins should call, like deleting a connector or deactivating a user.
+
+The UserRole enum (ADMIN, MEMBER, VIEWER) is stored on the user and included in the JWT claim. It is available at request time without a database lookup. Future authorization rules can reference it: `claims.get("role", String.class)`.
+
+### How the React frontend is structured
+
+The frontend follows a layered pattern:
+
+`src/types/index.ts` defines TypeScript interfaces that mirror the backend's DTOs. These are the contract between frontend and backend. If a backend response shape changes, the TypeScript compiler catches the mismatch at build time.
+
+`src/lib/api.ts` defines the Axios client and all API calls as typed functions. The Axios interceptors live here: one adds the auth header and org ID to every request, one handles 401s by clearing the auth store and redirecting to login. Centralizing this means every API call in the app benefits automatically — no component needs to handle auth headers or 401 redirects.
+
+`src/store/authStore.ts` is the single source of truth for authentication state. It persists to localStorage via Zustand's `persist` middleware. Components read from this store using the `useAuthStore` selector hook.
+
+`src/components/ProtectedRoute.tsx` is the gatekeeper. Any route wrapped in `<ProtectedRoute>` checks `isAuthenticated()` — if false, it redirects to `/login`. This is how the router prevents unauthenticated users from accessing any page.
+
+`src/components/Layout.tsx` provides the sidebar navigation shared across all authenticated pages. It reads the user's display name, email, and organization from the auth store. The NavLink component from react-router-dom automatically applies an active class to the link matching the current URL.
+
+Each page in `src/pages/` is a self-contained component that manages its own data fetching via React Query. Pages do not share state with each other — they each read from the store or fetch from the API.
+
+### Force-directed graphs and why they're the right visualization for a knowledge graph
+
+The People page uses `react-force-graph-2d`, which implements a force-directed layout algorithm. In this layout, nodes repel each other (like magnets with the same pole), and edges act as springs that pull connected nodes together. The algorithm runs iteratively until the system reaches equilibrium, producing a layout where closely connected nodes cluster together and loosely connected nodes spread apart.
+
+This is exactly the right visualization for a knowledge graph. A table of people and their associated concepts is flat — you cannot see which concepts connect multiple people, or which person is a hub of knowledge. In a force-directed graph, a concept mentioned by ten people appears in the center of ten connections, visually prominent. A person who has authored documents on many topics appears with many edges. A cluster of related concepts appears as a visual group.
+
+The graph is not static — it updates whenever the knowledge graph is enriched by new ingested content. Each time the embedding service processes a new document and the knowledge-graph-service creates new nodes and relationships, the next fetch of `/api/v1/graph/people` returns the updated graph.
+
+### Why the AskPage uses a chat-style interface rather than a form
+
+A single text box with a Submit button is technically sufficient for querying the knowledge base. The chat-style interface (conversation history, alternating message bubbles, streaming-style typing indicator) is an intentional design choice.
+
+The primary reason is context preservation. In a form-based interface, each query is independent — you submit, get an answer, and the answer disappears when you submit the next query. In a conversation interface, the full history of questions and answers is visible on screen. When a user asks a follow-up question ("what were the reasons for that decision?"), they can see their previous question and its answer, which helps them formulate the next question precisely.
+
+The secondary reason is perceived responsiveness. The bouncing dots animation during the LLM's response (which may take 5–20 seconds on CPU) signals that the system is working. Without this feedback, users assume the page has frozen.
+
+Each message in the conversation is a local React state object. The conversation is not persisted to the backend — if the user refreshes, it clears. Persisting conversation history would require a new database table and is a reasonable future enhancement, but it adds complexity and is not necessary for the core use case.
